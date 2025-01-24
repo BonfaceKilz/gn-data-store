@@ -1,5 +1,5 @@
 (defpackage :dump
-  (:use :common-lisp)
+  (:use :common-lisp :ieee-floats)
   (:import-from :alexandria :iota :once-only :with-gensyms)
   (:import-from :ironclad :with-octet-input-stream :with-octet-output-stream)
   (:import-from :listopia :all :any :split-at)
@@ -17,6 +17,15 @@
 
 
 ;; Utilities
+(defun decode-float-vector (vector size)
+  (let ((data (make-array size)))
+    (with-octet-input-stream (s vector)
+      (let ((decoded-data (make-array 8 :element-type '(unsigned-byte 8))))
+	(dotimes (i size)
+	  (read-sequence decoded-data s)
+	  (setf (aref data i) (decode-float32 (lmdb:octets-to-uint64 decoded-data)))))
+      data)))
+
 (defun for-each-indexed (function list &optional (start 0))
   "Apply FUNCTION successively on every element of LIST.  FUNCTION is
 invoked as (FUNCTION INDEX ELEMENT) where ELEMENT is an element of
@@ -228,12 +237,19 @@ the database."
                db
                (with-octet-output-stream (stream)
                  (dotimes (i (db-table-nrows matrix))
-                   (write-sequence (db-matrix-row-ref matrix i)
-                                   stream))
-                 (dotimes (i (db-table-ncols matrix))
-                   (write-sequence (db-matrix-column-ref matrix i)
-                                   stream)))
+		   (map 'vector #'(lambda (value)
+				    (write-sequence
+				     (lmdb:uint64-to-octets (encode-float32 value))
+				     stream))
+			(db-matrix-row-ref matrix i)))
+                 (dotimes (j (db-table-ncols matrix))
+		   (map 'vector #'(lambda (value)
+				    (write-sequence
+				     (lmdb:uint64-to-octets (encode-float32 value))
+				     stream))
+			(db-matrix-column-ref matrix j))))
                `(("matrix" . ,hash))))))
+
 
 (defun db-all-matrices (db)
   "Return a list of all matrices in DB, newest first."
@@ -243,23 +259,27 @@ the database."
             (iota (hash-vector-length all-matrix-hashes)))))
 
 (defun db-matrix (db hash)
-  (let ((nrows (lmdb:octets-to-uint64
-                (db-metadata-get db hash "nrows")))
-        (ncols (lmdb:octets-to-uint64
-                (db-metadata-get db hash "ncols")))
-        (hash-length (ironclad:digest-length *blob-hash-digest*)))
+  "Return the matrix identified by HASH from matrix DB."
+  (let* ((nrows (lmdb:octets-to-uint64
+		 (db-metadata-get db hash "nrows")))
+	 (ncols (lmdb:octets-to-uint64
+		 (db-metadata-get db hash "ncols")))
+	 (data (db-get db hash))
+	 (hash-length (ironclad:digest-length *blob-hash-digest*)))
     (make-db-table
      :db db
      :hash hash
      :nrows nrows
      :ncols ncols
      :row-pointers (make-array (* nrows hash-length)
-                               :element-type '(unsigned-byte 8)
-                               :displaced-to (db-get db hash))
+			       :element-type '(unsigned-byte 8)
+			       :displaced-to data)
      :column-pointers (make-array (* ncols hash-length)
-                                  :element-type '(unsigned-byte 8)
-                                  :displaced-to (db-get db hash)
-                                  :displaced-index-offset (* nrows hash-length)))))
+				  :element-type '(unsigned-byte 8)
+				  :displaced-to data
+				  :displaced-index-offset
+				  (* nrows hash-length)))))
+
 
 (defun db-matrix-put (db data)
   "Put MATRIX into DB and return the hash."
@@ -267,35 +287,49 @@ the database."
     (match (array-dimensions matrix)
       ((list nrows ncols)
        (db-put
-        db
-        (with-octet-output-stream (stream)
-          (dotimes (i nrows)
-            (write-sequence (db-put db (matrix-row matrix i))
-                            stream))
-          (dotimes (j ncols)
-            (write-sequence (db-put db (matrix-column matrix j))
-                            stream)))
-        `(("nrows" . ,nrows)
-          ("ncols" . ,ncols)))))))
+	db
+	(with-octet-output-stream (stream)
+	  (dotimes (i nrows)
+	    (let* ((encoded-data
+		     (with-octet-output-stream (s)
+		       (map 'vector
+			    #'(lambda (value)
+				(write-sequence
+				 (lmdb:uint64-to-octets (encode-float32 value))
+				 s))
+			    (matrix-row matrix i)))))
+	      (write-sequence (db-put db encoded-data) stream)))
+	  (dotimes (j ncols)
+	    (let* ((encoded-data
+		     (with-octet-output-stream (s)
+		       (map 'vector
+			    #'(lambda (value)
+				(write-sequence
+				 (lmdb:uint64-to-octets (encode-float32 value))
+				 s))
+			    (matrix-column matrix j)))))
+	      (write-sequence (db-put db encoded-data) stream))))
+	`(("nrows" . ,nrows)
+	  ("ncols" . ,ncols)))))))
 
 (defun db-current-matrix (db)
   "Return the latest version of the matrix in DB."
-  (let* ((read-optimized-blob (db-get db (db-get db "current")))
-         (current-matrix-hash (db-current-matrix-hash db))
-         (nrows (lmdb:octets-to-uint64
-                 (db-metadata-get db current-matrix-hash "nrows")))
-         (ncols (lmdb:octets-to-uint64
-                 (db-metadata-get db current-matrix-hash "ncols"))))
+  (let* ((current-matrix-hash (db-current-matrix-hash db))
+	 (nrows (lmdb:octets-to-uint64
+		 (db-metadata-get db current-matrix-hash "nrows")))
+	 (ncols (lmdb:octets-to-uint64
+		 (db-metadata-get db current-matrix-hash "ncols")))
+	 (read-optimized-blob
+	   (decode-float-vector (db-get db (db-get db "current"))
+				(* nrows ncols))))
     (make-db-table
      :db db
      :nrows nrows
      :ncols ncols
      :array (make-array (list nrows ncols)
-                        :element-type '(unsigned-byte 8)
-                        :displaced-to read-optimized-blob)
+			:displaced-to read-optimized-blob)
      :transpose (make-array (list ncols nrows)
-                            :element-type '(unsigned-byte 8)
-                            :displaced-to read-optimized-blob))))
+			    :displaced-to read-optimized-blob))))
 
 (defun db-matrix-ref (matrix)
   "Return MATRIX as a 2-dimensional array."
@@ -319,9 +353,11 @@ the database."
         (array (db-table-array matrix)))
     (if array
         (matrix-row array i)
-        (db-get
-         db
-         (hash-vector-ref (db-table-row-pointers matrix) i)))))
+	(let ((encoded-float-vector
+		(db-get db (hash-vector-ref (db-table-row-pointers matrix) i))))
+	  (decode-float-vector
+	   encoded-float-vector
+	   (/ (length encoded-float-vector) 8))))))
 
 (defun db-matrix-column-ref (matrix j)
   "Return the Jth column of db MATRIX."
@@ -329,9 +365,11 @@ the database."
         (transpose (db-table-transpose matrix)))
     (if transpose
         (matrix-row transpose j)
-        (db-get
-         db (hash-vector-ref (db-table-column-pointers matrix)
-                             j)))))
+	(let ((encoded-float-vector
+		(db-get db (hash-vector-ref (db-table-column-pointers matrix) j))))
+	  (decode-float-vector
+	   encoded-float-vector
+	   (/ (length encoded-float-vector) 8))))))
 
 (defun hash-in-hash-vector-p (hash hash-vector)
   "Return non-nil if HASH is in HASH-VECTOR. Else, return nil."
